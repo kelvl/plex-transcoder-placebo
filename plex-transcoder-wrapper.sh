@@ -28,7 +28,9 @@ PLACEBO_CURVES='auto clip st2094-40 st2094-10 bt.2390 bt.2446a spline reinhard m
 TONEMAPPER="${PLACEBO_TONEMAPPER:-libplacebo}"
 TONEMAPX_CURVES='none linear gamma clip reinhard hable mobius bt2390'
 
-log() { [ -n "${PLACEBO_DEBUG:-}" ] && printf '%s\n' "$*" >> /tmp/plex-placebo.log; return 0; }
+# PLACEBO_LOG: where debug lines go (default /tmp/plex-placebo.log). Containers running with
+# readOnlyRootFilesystem need it pointed at a writable path; it only logs with PLACEBO_DEBUG set.
+log() { [ -n "${PLACEBO_DEBUG:-}" ] && printf '%s\n' "$*" >> "${PLACEBO_LOG:-/tmp/plex-placebo.log}" 2>/dev/null; return 0; }
 
 exec_custom() {
     # Bundled libplacebo/Vulkan/VA first, so we get the versions this binary was built
@@ -38,7 +40,15 @@ exec_custom() {
     # Ours does shadow that mod's libva. That's deliberate: its stack is musl-built and our
     # binary is glibc, so they can't be mixed -- we carry a matching glibc libva and VA
     # driver instead. If VAAPI encoding ever breaks after a container bump, look here first.
-    export LD_LIBRARY_PATH="/plex-placebo/lib:${LD_LIBRARY_PATH:-}"
+    # PLACEBO_ISOLATE_LIBS=1 drops the inherited path entirely. Needed when the container puts
+    # musl-built libraries on LD_LIBRARY_PATH (e.g. an Alpine Mesa staged for Plex's own musl
+    # transcoder): anything our bundle lacks (libz, libzstd, libstdc++...) would otherwise
+    # resolve to a musl build and crash this glibc binary at load.
+    if [ -n "${PLACEBO_ISOLATE_LIBS:-}" ]; then
+        export LD_LIBRARY_PATH="/plex-placebo/lib"
+    else
+        export LD_LIBRARY_PATH="/plex-placebo/lib:${LD_LIBRARY_PATH:-}"
+    fi
     export LIBVA_DRIVERS_PATH="/plex-placebo/lib/dri"
     export VK_DRIVER_FILES="/plex-placebo/icd.d/radeon_icd.x86_64.json"
     export VK_ICD_FILENAMES="$VK_DRIVER_FILES"
@@ -67,6 +77,9 @@ chain() {
     echo "plex-transcoder-placebo: no usable transcoder found" >&2
     exit 127
 }
+
+# Kill switch: everything goes to the chained (stock) transcoder.
+[ -n "${PLACEBO_DISABLE:-}" ] && chain "$@"
 
 case "$*" in
     *tonemap=*) ;;
