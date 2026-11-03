@@ -5,6 +5,9 @@
 # they simply omit the flags at build time. So this is a flag flip, not a patch series.
 set -euo pipefail
 
+# Resolve before any cd: $0 is relative when invoked as `bash build.sh`.
+SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
+
 SRC_URL="${SRC_URL:-https://downloads.plex.tv/ffmpeg-source/}"
 WORK="${WORK:-$(pwd)/work}"
 OUT="${OUT:-$(pwd)/dist}"
@@ -33,6 +36,20 @@ fi
 rm -rf "${WORK:?}/$SRCDIR"
 tar -xf "$WORK/plex-ffmpeg.tar" -C "$WORK"
 cd "$WORK/$SRCDIR"
+
+# Local patches on top of Plex's source (e.g. jellyfin-ffmpeg's SIMD tonemapx filter).
+# Applied strictly: a hunk that no longer applies means Plex moved the base, and we'd rather
+# fail the build than ship a transcoder missing the filter the wrapper rewrites to.
+PATCH_DIR="${PATCH_DIR:-$SCRIPT_DIR/patches}"
+echo "==> Patch dir: $PATCH_DIR"
+if [ -d "$PATCH_DIR" ]; then
+  for p in "$PATCH_DIR"/*.patch; do
+    [ -f "$p" ] || continue
+    echo "==> Applying $(basename "$p")"
+    patch -p1 --forward --no-backup-if-mismatch < "$p" \
+      || { echo "ERROR: $(basename "$p") does not apply to source ${PLEX_SHA:0:7}"; exit 1; }
+  done
+fi
 
 # Sanity: bail loudly if Plex ever drops to a base without libplacebo, rather than
 # silently producing a transcoder that can't tone map.
@@ -76,6 +93,10 @@ install -Dm755 ffmpeg "$OUT/Plex Transcoder"
 "$OUT/Plex Transcoder" -hide_banner -filters > "$WORK/filters.txt"
 grep -q libplacebo "$WORK/filters.txt" \
   || { echo "ERROR: built binary has no libplacebo filter"; exit 1; }
+if ls "$PATCH_DIR"/*tonemapx*.patch >/dev/null 2>&1; then
+  grep -q tonemapx "$WORK/filters.txt" \
+    || { echo "ERROR: tonemapx patch applied but built binary has no tonemapx filter"; exit 1; }
+fi
 
 echo "$PLEX_SHA" > "$OUT/PLEX_SOURCE_SHA"
 
@@ -86,9 +107,11 @@ cp "$WORK/plex-ffmpeg.tar.gz" "$OUT/plex-ffmpeg-source-$PLEX_SHA.tar.gz"
 TARBALL_SHA256=$(sha256sum "$WORK/plex-ffmpeg.tar.gz" | cut -d' ' -f1)
 install -Dm644 LICENSE.md "$OUT/licenses/ffmpeg-LICENSE.md"
 install -Dm644 COPYING.LGPLv2.1 "$OUT/licenses/COPYING.LGPLv2.1"
+if [ -d "$PATCH_DIR" ]; then mkdir -p "$OUT/licenses/patches" && cp "$PATCH_DIR"/*.patch "$OUT/licenses/patches/" 2>/dev/null || true; fi
 cat > "$OUT/licenses/SOURCE.txt" <<EOF
 This binary is a build of Plex's published GPL/LGPL ffmpeg source, unmodified except for
-the configure flags in build.sh (notably --enable-vulkan --enable-libplacebo).
+the configure flags in build.sh (notably --enable-vulkan --enable-libplacebo) and the
+patches shipped under licenses/patches/ (jellyfin-ffmpeg tonemapx filter, GPL/LGPL).
 
 Upstream source sha : $PLEX_SHA
 Obtained from       : $SRC_URL

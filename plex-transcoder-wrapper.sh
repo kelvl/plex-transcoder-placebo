@@ -1,6 +1,7 @@
 #!/bin/sh
-# Swaps Plex's software tone mapping for GPU libplacebo, and chains to whatever binary was
-# at this path before us for everything else.
+# Swaps Plex's software tone mapping for GPU libplacebo (default) or jellyfin's SIMD tonemapx
+# (PLACEBO_TONEMAPPER=tonemapx), and chains to whatever binary was at this path before us for
+# everything else.
 #
 # -f (noglob): filter graphs are full of [label] which are glob patterns. Nothing here wants
 # pathname expansion, and the graph-reassembly loop splits an unquoted string, so a file in
@@ -19,6 +20,13 @@ CUSTOM="${PLACEBO_TRANSCODER:-/plex-placebo/bin/Plex-Transcoder-placebo}"
 # the mod's job is to move tone mapping onto the GPU, not to second-guess the user's look.
 # PLACEBO_TONEMAP forces a curve Plex can't select, e.g. bt.2390 or spline.
 PLACEBO_CURVES='auto clip st2094-40 st2094-10 bt.2390 bt.2446a spline reinhard mobius hable gamma linear'
+# PLACEBO_TONEMAPPER=tonemapx swaps libplacebo for jellyfin-ffmpeg's SIMD (SSE/AVX2/FMA) CPU
+# tone mapper, patched into this build (patches/0001-add-tonemapx-filter.patch). The graph is
+# restructured the same way (GPU scale first), so the CPU only tone-maps output-sized frames.
+# On small iGPUs this beats libplacebo (Radeon 780M, 4K HDR -> 1080p: ~4.3x vs ~3.3x) and needs
+# no Vulkan at all. tonemapx also understands Dolby Vision RPU reshaping.
+TONEMAPPER="${PLACEBO_TONEMAPPER:-libplacebo}"
+TONEMAPX_CURVES='none linear gamma clip reinhard hable mobius bt2390'
 
 log() { [ -n "${PLACEBO_DEBUG:-}" ] && printf '%s\n' "$*" >> /tmp/plex-placebo.log; return 0; }
 
@@ -115,9 +123,21 @@ if [ -z "$curve" ]; then
         | sed -nE 's/.*tonemap=(tonemap=)?([a-zA-Z0-9._-]+).*/\2/p')
 fi
 
-case " $PLACEBO_CURVES " in
-    *" $curve "*) ;;
-    *) log "curve '$curve' not supported by libplacebo, chaining"; chain "$@" ;;
+case $TONEMAPPER in
+    tonemapx)
+        # Plex spells it bt.2390 nowhere, but PLACEBO_TONEMAP users might.
+        [ "$curve" = bt.2390 ] && curve=bt2390
+        case " $TONEMAPX_CURVES " in
+            *" $curve "*) ;;
+            *) log "curve '$curve' not supported by tonemapx, chaining"; chain "$@" ;;
+        esac
+        ;;
+    *)
+        case " $PLACEBO_CURVES " in
+            *" $curve "*) ;;
+            *) log "curve '$curve' not supported by libplacebo, chaining"; chain "$@" ;;
+        esac
+        ;;
 esac
 
 # PLACEBO_OPTS passes extra libplacebo options through, e.g.
@@ -136,7 +156,14 @@ if [ -n "$placebo_opts" ]; then
     esac
 fi
 
-PLACEBO="libplacebo=tonemapping=$curve:${placebo_opts:+$placebo_opts:}colorspace=bt709:color_primaries=bt709:color_trc=bt709:range=tv:format=nv12"
+if [ "$TONEMAPPER" = tonemapx ]; then
+    # Same output contract as the libplacebo variant (bt709 SDR, limited range, nv12) so the
+    # rest of Plex's graph -- `format=pix_fmts=nv12,hwupload` -- is untouched. PLACEBO_OPTS is
+    # libplacebo-specific and deliberately not forwarded here.
+    PLACEBO="tonemapx=tonemap=$curve:t=bt709:m=bt709:p=bt709:r=tv:format=nv12"
+else
+    PLACEBO="libplacebo=tonemapping=$curve:${placebo_opts:+$placebo_opts:}colorspace=bt709:color_primaries=bt709:color_trc=bt709:range=tv:format=nv12"
+fi
 
 # Move the downscale onto the GPU and ahead of the tone map.
 #

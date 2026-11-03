@@ -102,3 +102,25 @@ docker build -t plex-placebo-mod .   # the mod image
 ./build.sh                           # just the transcoder, into ./dist
 ./test-chain.sh && ./test-rewrite.sh # tests
 ```
+
+## tonemapx mode (this fork)
+
+This fork also patches jellyfin-ffmpeg's SIMD CPU tone mapper `tonemapx` (LGPL-2.1+) into the
+build (`patches/0001-add-tonemapx-filter.patch`, ported from jellyfin-ffmpeg v7.0.2-9 onto
+Plex's ffmpeg 6.1.3 source). Set `PLACEBO_TONEMAPPER=tonemapx` to use it instead of
+libplacebo. The graph is restructured the same way (GPU `scale_vaapi` first, then tone map the
+output-sized frame on the CPU), so no Vulkan is involved.
+
+Measured on a Radeon 780M (gfx1103, Mesa 25.2.8), 60 s of 4K HEVC Dolby Vision P8.1 → 1080p
+H.264 VAAPI:
+
+| pipeline | speed |
+|---|---|
+| Plex's graph unchanged | 0.84x |
+| `PLACEBO_TONEMAPPER=tonemapx` | 5.3x |
+| libplacebo (default) | 3.7x |
+
+Port notes: two fixes over the v7.0.2-9 patch — the tone-map LUT was built from the pre-detection
+peak option (0 when auto: hable garbage, reinhard black), and a DV L0 peak of 0 now falls back to
+the HDR10 static metadata (this ffmpeg base has no DM extension-block API, so no L1 per-scene peak).
+For DV P8 sources `PLACEBO_TONEMAP=bt2390` gives the most consistent result.
