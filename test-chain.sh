@@ -9,6 +9,28 @@ set -uo pipefail
 REPO=$(cd "$(dirname "$0")" && pwd)
 fail=0
 
+# The stand-in for the real transcoder must be a genuine ELF (the install guard tells
+# binaries from wrapper scripts by their first two bytes) that echoes its argv whatever
+# path it is exec'd under. /bin/echo used to do this, but on Ubuntu 26 coreutils is the
+# uutils multicall build, which refuses to run under a name that isn't a known utility
+# ("Requested utility ... does not match executable name"). Build a tiny one instead so the
+# test doesn't depend on what the host's coreutils happens to be.
+FAKEDIR=$(mktemp -d)
+trap 'rm -rf "$FAKEDIR"' EXIT
+FAKE="$FAKEDIR/fake-transcoder"
+CC=${CC:-$(command -v cc || command -v gcc || command -v clang)} \
+    || { echo "FAIL: need a C compiler to build the fake transcoder"; exit 1; }
+cat > "$FAKEDIR/echo.c" <<'C'
+#include <stdio.h>
+int main(int argc, char **argv) {
+    for (int i = 1; i < argc; i++) printf(i > 1 ? " %s" : "%s", argv[i]);
+    putchar('\n');
+    return 0;
+}
+C
+"$CC" -O2 -o "$FAKE" "$FAKEDIR/echo.c" \
+    || { echo "FAIL: could not build the fake transcoder"; exit 1; }
+
 GRAPH='[0:0]scale=w=3840:h=2160[1];[1]format=p010,tonemap=hable[2];[2]format=pix_fmts=nv12[3];[3][0]overlay[4];[4]hwupload[5]'
 
 setup() {
@@ -17,8 +39,8 @@ setup() {
     mkdir -p "$PLEXDIR" "$MOD/bin" "$SIM/init"
     # A genuine ELF stands in for the real transcoder, so the script-detection guard sees a
     # binary; echoing its args makes "did the chain reach it" observable.
-    cp /bin/echo "$PLEXDIR/Plex Transcoder"
-    cp /bin/echo "$SIM/real_reference"
+    cp "$FAKE" "$PLEXDIR/Plex Transcoder"
+    cp "$FAKE" "$SIM/real_reference"
     install -m755 "$REPO/plex-transcoder-wrapper.sh" "$MOD/bin/wrapper.sh"
     # Stands in for the custom ffmpeg build; echoes the argv it was handed so the test can
     # assert the rewrite actually happened.
@@ -80,7 +102,7 @@ done
 # Plex updating in place drops a fresh stock binary over our wrapper; we must re-wrap it
 # rather than sit inert, and the stale chain target must be replaced.
 setup; boot placebo vaapi
-cp /bin/echo "$PLEXDIR/Plex Transcoder"
+cp "$FAKE" "$PLEXDIR/Plex Transcoder"
 boot placebo vaapi
 check "plex updated in place"
 rm -rf "$SIM"
